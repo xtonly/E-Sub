@@ -2,6 +2,7 @@
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # 基础路径与默认参数（无任何硬编码敏感密钥）
+SCRIPT_VER="v1.1"
 DATA_DIR="/etc/sub-store"
 FRONTEND_DIR="/etc/sub-store/frontend"
 BACKUP_DIR="/etc/sub-store/backups"
@@ -18,13 +19,17 @@ GREEN="\033[32m"
 YELLOW="\033[33m"
 RED="\033[31m"
 CYAN="\033[36m"
+BOLD="\033[1m"
 RESET="\033[0m"
 
-LINE="${CYAN}========================================================================${RESET}"
-SUB_LINE="${CYAN}------------------------------------------------------------------------${RESET}"
+# 动态边框绘制工具函数
+repeat_char() {
+    local char="$1" count="$2"
+    printf "%${count}s" "" | tr ' ' "$char"
+}
 
 gen_random_path() {
-    head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 32
+    head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 24
 }
 
 # 规范化域名输入（自动补全 https:// 并去除末尾斜杠）
@@ -51,14 +56,15 @@ CONF
     chmod 600 "$CONF_FILE"
 }
 
-# 首次运行初始化向导（仅在无配置文件且非后台定时任务时触发）
+# 首次运行初始化向导
 init_wizard() {
     clear
-    echo -e "$LINE"
-    echo -e "             欢迎使用 E-Sub 首次安装初始化向导"
-    echo -e "$LINE"
+    local init_line
+    init_line="${CYAN}$(repeat_char '=' 68)${RESET}"
+    echo -e "$init_line"
+    echo -e "               ${BOLD}欢迎使用 E-Sub 首次安装初始化向导${RESET}"
+    echo -e "$init_line"
 
-    # 尝试探测已有容器参数作为默认值
     local exist_port="" exist_path=""
     if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
         exist_port=$(docker inspect --format='{{(index (index .HostConfig.PortBindings "3001/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
@@ -160,19 +166,20 @@ run_container() {
 }
 
 show_login_links() {
-    local base_url
+    local base_url full_url w line
     base_url=$(get_base_url)
-    echo -e "$SUB_LINE"
-    echo -e " 前端访问入口 : ${GREEN}${base_url}${RESET}"
-    echo -e " 后端接口地址 : ${YELLOW}${base_url}${BACKEND_PATH}${RESET}"
-    echo -e ""
-    echo -e " ${CYAN}▼ 免填参数一键登录完整链接 (复制整行到浏览器打开):${RESET}"
-    echo -e "${GREEN}${base_url}?api=${base_url}${BACKEND_PATH}${RESET}"
+    full_url="${base_url}?api=${base_url}${BACKEND_PATH}"
+    w=$(( ${#full_url} + 4 ))
+    [ "$w" -lt 68 ] && w=68
+    line="${CYAN}$(repeat_char '-' "$w")${RESET}"
+
+    echo -e "$line"
+    echo -e " ${CYAN}✦ 免填参数一键登录地址 (请复制下方完整链接在浏览器打开):${RESET}"
+    echo -e " ${GREEN}${BOLD}${full_url}${RESET}"
     if [ -n "${CUSTOM_DOMAIN:-}" ]; then
-        echo -e ""
-        echo -e " ${YELLOW}提示: 请确保你的反向代理 (Caddy/Nginx) 已将 ${CUSTOM_DOMAIN} 转发至 127.0.0.1:${HOST_PORT}${RESET}"
+        echo -e " ${YELLOW}提示: 请确保反向代理已将 ${CUSTOM_DOMAIN} 转发至 http://127.0.0.1:${HOST_PORT}${RESET}"
     fi
-    echo -e "$SUB_LINE"
+    echo -e "$line"
 }
 
 update_frontend() {
@@ -235,21 +242,25 @@ update_backend() {
 manage_config() {
     while true; do
         clear
-        local domain_display="${CUSTOM_DOMAIN:-未设置 (当前使用 IP:${HOST_PORT})}"
-        echo -e "$LINE"
-        echo -e "              配置管理 (反代域名 / Path / 端口)"
-        echo -e "$LINE"
+        local cfg_line cfg_sub domain_display
+        cfg_line="${CYAN}$(repeat_char '=' 68)${RESET}"
+        cfg_sub="${CYAN}$(repeat_char '-' 68)${RESET}"
+        domain_display="${CUSTOM_DOMAIN:-未设置 (当前使用 IP:${HOST_PORT})}"
+
+        echo -e "$cfg_line"
+        echo -e "                ${BOLD}配置管理 (反代域名 / Path / 端口)${RESET}"
+        echo -e "$cfg_line"
         echo -e " 当前反代域名 : ${GREEN}${domain_display}${RESET}"
         echo -e " 当前后端密钥 : ${YELLOW}${BACKEND_PATH}${RESET}"
         echo -e " 本地监听端口 : ${CYAN}${HOST_PORT}${RESET}"
-        echo -e "$SUB_LINE"
+        echo -e "$cfg_sub"
         echo -e "  ${GREEN}1.${RESET} 设置 / 修改反代域名"
         echo -e "  ${GREEN}2.${RESET} 清除反代域名 (恢复默认 IP+端口 显示)"
-        echo -e "  ${GREEN}3.${RESET} 一键重新生成 32 位随机 Path 密钥 (防泄露推荐)"
+        echo -e "  ${GREEN}3.${RESET} 一键重新生成随机 Path 密钥 (防泄露推荐)"
         echo -e "  ${GREEN}4.${RESET} 自定义输入 Path 密钥路径"
         echo -e "  ${GREEN}5.${RESET} 修改宿主机映射端口"
         echo -e "  ${GREEN}0.${RESET} 返回主菜单"
-        echo -e "$LINE"
+        echo -e "$cfg_line"
 
         local sub_choice need_restart="false"
         read -rp "请选择操作 [0-5]: " sub_choice
@@ -276,7 +287,7 @@ manage_config() {
                 ;;
             3)
                 local confirm_gen
-                read -rp "确认重新生成随机 Path 吗？旧订阅链接需更新接口 [y/N (输入 0 取消)]: " confirm_gen
+                read -rp "确认重新生成随机 Path 吗？旧链接将立即失效 [y/N (输入 0 取消)]: " confirm_gen
                 if [[ "$confirm_gen" =~ ^[yY]$ ]]; then
                     BACKEND_PATH="/$(gen_random_path)"
                     save_config
@@ -379,7 +390,7 @@ restore_data() {
         ((i++))
     done
     echo -e "  ${GREEN}0.${RESET} 取消并返回主菜单"
-    echo -e "$SUB_LINE"
+    echo -e "${CYAN}$(repeat_char '-' 56)${RESET}"
 
     local sel
     read -rp "请输入要恢复的备份序号 [0-$((i-1))]: " sel
@@ -461,40 +472,59 @@ if [ "${1:-}" = "--auto" ]; then
     exit 0
 fi
 
-# 3. 仅在未设置反代域名时才探测公网 IP，加快面板打开速度
+# 3. 仅在未设置反代域名时才探测公网 IP
 PUBLIC_IP=""
 if [ -z "${CUSTOM_DOMAIN:-}" ]; then
     PUBLIC_IP=$(curl -4fsSL --max-time 2 https://api.ipify.org 2>/dev/null || curl -4fsSL --max-time 2 https://ifconfig.me 2>/dev/null || echo "你的服务器IP")
 fi
 
-# 4. 交互式主菜单循环
+# 4. 交互式主菜单循环（自适应动态宽度美化版）
 while true; do
     if [ -z "${CUSTOM_DOMAIN:-}" ] && [ -z "$PUBLIC_IP" ]; then
         PUBLIC_IP=$(curl -4fsSL --max-time 2 https://api.ipify.org 2>/dev/null || echo "你的服务器IP")
     fi
     BASE_URL=$(get_base_url)
+    FULL_LOGIN_URL="${BASE_URL}?api=${BASE_URL}${BACKEND_PATH}"
+
+    # 根据完整 URL 长度动态计算边框宽度（最小宽度 72，确保完整包裹 URL 不溢出）
+    BOX_WIDTH=$(( ${#FULL_LOGIN_URL} + 3 ))
+    [ "$BOX_WIDTH" -lt 72 ] && BOX_WIDTH=72
+    DYNAMIC_LINE="${CYAN}$(repeat_char '=' "$BOX_WIDTH")${RESET}"
+    DYNAMIC_SUB="${CYAN}$(repeat_char '-' "$BOX_WIDTH")${RESET}"
+
+    # 计算标题居中填充空格（标题视觉显示宽度约 36 列）
+    TITLE_PAD=$(( (BOX_WIDTH - 36) / 2 ))
+    [ "$TITLE_PAD" -lt 2 ] && TITLE_PAD=2
+    TITLE_SPACES=$(printf "%${TITLE_PAD}s" "")
 
     clear
     FE_VER=$(cat "$VERSION_FILE" 2>/dev/null || echo "未安装")
     if [ "$(docker inspect --format='{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" = "true" ]; then
-        STATUS_STR="${GREEN}运行中 (本地端口: ${HOST_PORT})${RESET}"
+        STATUS_STR="${GREEN}● 运行中${RESET} (本地端口: ${CYAN}${HOST_PORT}${RESET})"
     else
-        STATUS_STR="${RED}未运行 (预设端口: ${HOST_PORT})${RESET}"
+        STATUS_STR="${RED}○ 未运行${RESET} (预设端口: ${CYAN}${HOST_PORT}${RESET})"
     fi
     if crontab -l 2>/dev/null | grep -qE "($BIN_PATH|/usr/local/bin/update-sub) --auto"; then
         CRON_STR="${GREEN}已开启 (每日 04:00)${RESET}"
     else
         CRON_STR="${YELLOW}未开启${RESET}"
     fi
+    if [ -n "${CUSTOM_DOMAIN:-}" ]; then
+        MODE_STR="${GREEN}反代域名 (${CUSTOM_DOMAIN})${RESET}"
+    else
+        MODE_STR="${YELLOW}IP 直连 (${PUBLIC_IP}:${HOST_PORT})${RESET}"
+    fi
 
-    echo -e "$LINE"
-    echo -e "               E-Sub (Sub-Store) 交互式管理面板 v1.0"
-    echo -e "$LINE"
-    echo -e " 容器状态 : ${STATUS_STR}"
-    echo -e " 前端版本 : ${GREEN}${FE_VER}${RESET}    自动更新 : ${CRON_STR}"
-    echo -e " 前端入口 : ${GREEN}${BASE_URL}${RESET}"
-    echo -e " 后端接口 : ${YELLOW}${BASE_URL}${BACKEND_PATH}${RESET}"
-    echo -e "$SUB_LINE"
+    echo -e "$DYNAMIC_LINE"
+    echo -e "${TITLE_SPACES}${BOLD}E-Sub (Sub-Store) 交互式管理面板 ${SCRIPT_VER}${RESET}"
+    echo -e "$DYNAMIC_LINE"
+    echo -e " 容器状态 : ${STATUS_STR}    自动更新 : ${CRON_STR}"
+    echo -e " 前端版本 : ${GREEN}${FE_VER}${RESET}                    访问模式 : ${MODE_STR}"
+    echo -e " 后端密钥 : ${YELLOW}${BACKEND_PATH}${RESET}"
+    echo -e "$DYNAMIC_SUB"
+    echo -e " ${CYAN}✦ 免填参数一键登录完整地址 (直接复制打开，自动绑定后端 API):${RESET}"
+    echo -e " ${GREEN}${BOLD}${FULL_LOGIN_URL}${RESET}"
+    echo -e "$DYNAMIC_SUB"
     echo -e "  ${GREEN}1.${RESET} 安装 / 智能增量更新前后端 (推荐)"
     echo -e "  ${GREEN}2.${RESET} 仅强制重下并热更新前端"
     echo -e "  ${GREEN}3.${RESET} 强制拉取镜像并重建后端容器"
@@ -503,10 +533,9 @@ while true; do
     echo -e "  ${GREEN}6.${RESET} 开启 / 关闭每日凌晨自动更新"
     echo -e "  ${GREEN}7.${RESET} 从备份文件恢复配置数据"
     echo -e "  ${GREEN}8.${RESET} 配置管理 (反代域名 / Path 密钥 / 端口)"
-    echo -e "  ${GREEN}9.${RESET} 获取免填参数一键登录完整链接"
     echo -e "  ${GREEN}0.${RESET} 退出脚本"
-    echo -e "$LINE"
-    read -rp "请输入选项数字 [0-9]: " choice
+    echo -e "$DYNAMIC_LINE"
+    read -rp "请输入选项数字 [0-8]: " choice
     echo ""
 
     case "$choice" in
@@ -539,15 +568,12 @@ while true; do
             manage_config
             continue
             ;;
-        9)
-            show_login_links
-            ;;
         0)
             echo -e "${GREEN}已退出管理面板（随时输入 e-sub 可再次打开）。${RESET}"
             exit 0
             ;;
         *)
-            echo -e "${RED}输入无效，请输入 0 到 9 之间的数字！${RESET}"
+            echo -e "${RED}输入无效，请输入 0 到 8 之间的数字！${RESET}"
             ;;
     esac
     echo ""
