@@ -20,8 +20,8 @@ RED="\033[31m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-LINE="${CYAN}================================================================${RESET}"
-SUB_LINE="${CYAN}----------------------------------------------------------------${RESET}"
+LINE="${CYAN}========================================================================${RESET}"
+SUB_LINE="${CYAN}------------------------------------------------------------------------${RESET}"
 
 gen_random_path() {
     head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 32
@@ -488,7 +488,7 @@ while true; do
     fi
 
     echo -e "$LINE"
-    echo -e "               E-Sub (Sub-Store) 交互式管理面板"
+    echo -e "               E-Sub (Sub-Store) 交互式管理面板 v1.0"
     echo -e "$LINE"
     echo -e " 容器状态 : ${STATUS_STR}"
     echo -e " 前端版本 : ${GREEN}${FE_VER}${RESET}    自动更新 : ${CRON_STR}"
