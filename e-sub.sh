@@ -2,7 +2,7 @@
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # 基础路径与默认参数（无任何硬编码敏感密钥）
-SCRIPT_VER="v1.1"
+SCRIPT_VER="v1.2"
 DATA_DIR="/etc/sub-store"
 FRONTEND_DIR="/etc/sub-store/frontend"
 BACKUP_DIR="/etc/sub-store/backups"
@@ -22,10 +22,25 @@ CYAN="\033[36m"
 BOLD="\033[1m"
 RESET="\033[0m"
 
-# 动态边框绘制工具函数
+# 动态字符重复工具
 repeat_char() {
     local char="$1" count="$2"
     printf "%${count}s" "" | tr ' ' "$char"
+}
+
+# 精确计算中英文混合字符串终端显示宽度并右侧补齐空格（确保双列严格对齐）
+format_col() {
+    local text="$1" color="$2" target_width="$3"
+    local total_bytes non_ascii_bytes ascii_len cjk_count vis_width pad_len spaces
+    total_bytes=$(printf '%s' "$text" | LC_ALL=C wc -c | tr -d ' ')
+    non_ascii_bytes=$(printf '%s' "$text" | LC_ALL=C tr -d '\000-\177' | LC_ALL=C wc -c | tr -d ' ')
+    ascii_len=$(( total_bytes - non_ascii_bytes ))
+    cjk_count=$(( non_ascii_bytes / 3 ))
+    vis_width=$(( ascii_len + cjk_count * 2 ))
+    pad_len=$(( target_width - vis_width ))
+    [ "$pad_len" -lt 2 ] && pad_len=2
+    spaces=$(printf "%${pad_len}s" "")
+    printf "%b%s%b%s" "$color" "$text" "$RESET" "$spaces"
 }
 
 gen_random_path() {
@@ -54,6 +69,19 @@ BACKEND_PATH="${BACKEND_PATH}"
 CUSTOM_DOMAIN="${CUSTOM_DOMAIN}"
 CONF
     chmod 600 "$CONF_FILE"
+}
+
+# 实时读取后端版本号（通过容器本地 /api/utils/env 接口获取）
+get_backend_version() {
+    local ver=""
+    if [ "$(docker inspect --format='{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" = "true" ]; then
+        ver=$(curl -fsSL --max-time 1 "http://127.0.0.1:${HOST_PORT}${BACKEND_PATH}/api/utils/env" 2>/dev/null \
+            | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | cut -d'"' -f4)
+        [ -z "$ver" ] && ver="运行中"
+    else
+        ver="未运行"
+    fi
+    echo "$ver"
 }
 
 # 首次运行初始化向导
@@ -163,21 +191,28 @@ run_container() {
       -v "${FRONTEND_DIR}:/opt/app/frontend" \
       "$IMAGE_NAME" >/dev/null
     docker image prune -f >/dev/null 2>&1 || true
+
+    # 等待后端服务端口就绪（最多等待 3 秒），以便立即读取最新后端版本号
+    for _ in 1 2 3 4 5 6; do
+        if curl -fsSL --max-time 1 "http://127.0.0.1:${HOST_PORT}${BACKEND_PATH}/api/utils/env" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+    done
 }
 
 show_login_links() {
     local base_url full_url w line
     base_url=$(get_base_url)
     full_url="${base_url}?api=${base_url}${BACKEND_PATH}"
-    w=$(( ${#full_url} + 4 ))
+    w=$(( ${#full_url} + 14 ))
     [ "$w" -lt 68 ] && w=68
     line="${CYAN}$(repeat_char '-' "$w")${RESET}"
 
     echo -e "$line"
-    echo -e " ${CYAN}✦ 免填参数一键登录地址 (请复制下方完整链接在浏览器打开):${RESET}"
-    echo -e " ${GREEN}${BOLD}${full_url}${RESET}"
+    echo -e " 一键登录 : ${GREEN}${BOLD}${full_url}${RESET}"
     if [ -n "${CUSTOM_DOMAIN:-}" ]; then
-        echo -e " ${YELLOW}提示: 请确保反向代理已将 ${CUSTOM_DOMAIN} 转发至 http://127.0.0.1:${HOST_PORT}${RESET}"
+        echo -e " 反代提示 : ${YELLOW}请确保反向代理已将 ${CUSTOM_DOMAIN} 转发至 http://127.0.0.1:${HOST_PORT}${RESET}"
     fi
     echo -e "$line"
 }
@@ -224,18 +259,20 @@ update_backend() {
         return 1
     fi
 
-    local latest_id running_id is_running
+    local latest_id running_id is_running cur_be_ver
     latest_id=$(docker image inspect --format='{{.Id}}' "$IMAGE_NAME" 2>/dev/null || echo "none")
     running_id=$(docker inspect --format='{{.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "not_running")
     is_running=$(docker inspect --format='{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || echo "false")
 
     if [ "$force" = "true" ] || [ "$latest_id" != "$running_id" ] || [ "$is_running" != "true" ]; then
-        echo -e "${CYAN}[后端] 🚀 正在部署并启动容器...${RESET}"
+        echo -e "${CYAN}[后端] 🚀 正在部署并启动最新后端容器...${RESET}"
         run_container
-        echo -e "${GREEN}[后端] ✅ 容器启动完成，旧镜像已清理！${RESET}"
+        cur_be_ver=$(get_backend_version)
+        echo -e "${GREEN}[后端] ✅ 容器启动完成 (当前后端版本: ${cur_be_ver})，旧镜像已清理！${RESET}"
         show_login_links
     else
-        echo -e "${GREEN}[后端] ✨ 镜像无变化且容器运行正常，无需重启。${RESET}"
+        cur_be_ver=$(get_backend_version)
+        echo -e "${GREEN}[后端] ✨ 镜像无变化且运行正常 (当前后端版本: ${cur_be_ver})，无需重启。${RESET}"
     fi
 }
 
@@ -446,7 +483,7 @@ toggle_cron() {
         echo -e "${YELLOW}[定时任务] 已关闭每日凌晨自动更新。${RESET}"
     else
         (crontab -l 2>/dev/null | grep -vE "($BIN_PATH|/usr/local/bin/update-sub)"; echo "0 4 * * * $BIN_PATH --auto >> $CRON_LOG 2>&1") | crontab -
-        echo -e "${GREEN}[定时任务] ✅ 已开启每日 04:00 自动静默更新（日志: $CRON_LOG）。${RESET}"
+        echo -e "${GREEN}[定时任务] ✅ 已开启每日 04:00 自动静默更新前后端（日志: $CRON_LOG）。${RESET}"
     fi
 }
 
@@ -463,12 +500,12 @@ check_deps
 load_or_init_config "${1:-}"
 install_shortcut
 
-# 2. 兼容 Crontab 后台静默调用: e-sub --auto
+# 2. 兼容 Crontab 后台静默调用: e-sub --auto（同时更新前端与后端）
 if [ "${1:-}" = "--auto" ]; then
-    echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] 自动检测更新开始 ==="
+    echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] 自动检测更新前后端开始 ==="
     update_frontend false
     update_backend false
-    echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] 自动检测更新结束 ==="
+    echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] 自动检测更新前后端结束 ==="
     exit 0
 fi
 
@@ -478,7 +515,7 @@ if [ -z "${CUSTOM_DOMAIN:-}" ]; then
     PUBLIC_IP=$(curl -4fsSL --max-time 2 https://api.ipify.org 2>/dev/null || curl -4fsSL --max-time 2 https://ifconfig.me 2>/dev/null || echo "你的服务器IP")
 fi
 
-# 4. 交互式主菜单循环（自适应动态宽度美化版）
+# 4. 交互式主菜单循环（双列严格对齐 + 自适应边框版）
 while true; do
     if [ -z "${CUSTOM_DOMAIN:-}" ] && [ -z "$PUBLIC_IP" ]; then
         PUBLIC_IP=$(curl -4fsSL --max-time 2 https://api.ipify.org 2>/dev/null || echo "你的服务器IP")
@@ -486,44 +523,52 @@ while true; do
     BASE_URL=$(get_base_url)
     FULL_LOGIN_URL="${BASE_URL}?api=${BASE_URL}${BACKEND_PATH}"
 
-    # 根据完整 URL 长度动态计算边框宽度（最小宽度 72，确保完整包裹 URL 不溢出）
-    BOX_WIDTH=$(( ${#FULL_LOGIN_URL} + 3 ))
-    [ "$BOX_WIDTH" -lt 72 ] && BOX_WIDTH=72
+    # 计算边框宽度（适配 " 一键登录 : " 12列前缀 + URL 长度 + 右侧余量，最小 74 列）
+    BOX_WIDTH=$(( ${#FULL_LOGIN_URL} + 14 ))
+    [ "$BOX_WIDTH" -lt 74 ] && BOX_WIDTH=74
     DYNAMIC_LINE="${CYAN}$(repeat_char '=' "$BOX_WIDTH")${RESET}"
     DYNAMIC_SUB="${CYAN}$(repeat_char '-' "$BOX_WIDTH")${RESET}"
 
-    # 计算标题居中填充空格（标题视觉显示宽度约 36 列）
     TITLE_PAD=$(( (BOX_WIDTH - 36) / 2 ))
     [ "$TITLE_PAD" -lt 2 ] && TITLE_PAD=2
     TITLE_SPACES=$(printf "%${TITLE_PAD}s" "")
 
-    clear
+    # 采集各项实时状态文本
     FE_VER=$(cat "$VERSION_FILE" 2>/dev/null || echo "未安装")
+    BE_VER=$(get_backend_version)
+    BACKUP_COUNT=$(ls -1 "${BACKUP_DIR}"/sub-store_backup_*.tar.gz 2>/dev/null | wc -l | tr -d ' ')
+
     if [ "$(docker inspect --format='{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" = "true" ]; then
-        STATUS_STR="${GREEN}● 运行中${RESET} (本地端口: ${CYAN}${HOST_PORT}${RESET})"
+        COL_STATUS=$(format_col "运行中 (端口 ${HOST_PORT})" "$GREEN" 26)
+        BE_COLOR="$GREEN"
     else
-        STATUS_STR="${RED}○ 未运行${RESET} (预设端口: ${CYAN}${HOST_PORT}${RESET})"
-    fi
-    if crontab -l 2>/dev/null | grep -qE "($BIN_PATH|/usr/local/bin/update-sub) --auto"; then
-        CRON_STR="${GREEN}已开启 (每日 04:00)${RESET}"
-    else
-        CRON_STR="${YELLOW}未开启${RESET}"
-    fi
-    if [ -n "${CUSTOM_DOMAIN:-}" ]; then
-        MODE_STR="${GREEN}反代域名 (${CUSTOM_DOMAIN})${RESET}"
-    else
-        MODE_STR="${YELLOW}IP 直连 (${PUBLIC_IP}:${HOST_PORT})${RESET}"
+        COL_STATUS=$(format_col "未运行 (端口 ${HOST_PORT})" "$RED" 26)
+        BE_COLOR="$YELLOW"
     fi
 
+    COL_FE=$(format_col "$FE_VER" "$GREEN" 26)
+
+    if crontab -l 2>/dev/null | grep -qE "($BIN_PATH|/usr/local/bin/update-sub) --auto"; then
+        COL_CRON=$(format_col "已开启 (04:00 前后端)" "$GREEN" 26)
+    else
+        COL_CRON=$(format_col "未开启" "$YELLOW" 26)
+    fi
+
+    if [ -n "${CUSTOM_DOMAIN:-}" ]; then
+        MODE_STR="${GREEN}反代域名${RESET}"
+    else
+        MODE_STR="${YELLOW}IP 直连${RESET}"
+    fi
+
+    clear
     echo -e "$DYNAMIC_LINE"
     echo -e "${TITLE_SPACES}${BOLD}E-Sub (Sub-Store) 交互式管理面板 ${SCRIPT_VER}${RESET}"
     echo -e "$DYNAMIC_LINE"
-    echo -e " 容器状态 : ${STATUS_STR}    自动更新 : ${CRON_STR}"
-    echo -e " 前端版本 : ${GREEN}${FE_VER}${RESET}                    访问模式 : ${MODE_STR}"
-    echo -e " 后端密钥 : ${YELLOW}${BACKEND_PATH}${RESET}"
+    echo -e " 运行状态 : ${COL_STATUS}访问模式 : ${MODE_STR}"
+    echo -e " 前端版本 : ${COL_FE}后端版本 : ${BE_COLOR}${BE_VER}${RESET}"
+    echo -e " 自动更新 : ${COL_CRON}数据备份 : ${CYAN}${BACKUP_COUNT} / 3 份${RESET}"
     echo -e "$DYNAMIC_SUB"
-    echo -e " ${CYAN}✦ 免填参数一键登录完整地址 (直接复制打开，自动绑定后端 API):${RESET}"
-    echo -e " ${GREEN}${BOLD}${FULL_LOGIN_URL}${RESET}"
+    echo -e " 一键登录 : ${GREEN}${BOLD}${FULL_LOGIN_URL}${RESET}"
     echo -e "$DYNAMIC_SUB"
     echo -e "  ${GREEN}1.${RESET} 安装 / 智能增量更新前后端 (推荐)"
     echo -e "  ${GREEN}2.${RESET} 仅强制重下并热更新前端"
