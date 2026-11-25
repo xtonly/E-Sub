@@ -1,7 +1,7 @@
 #!/bin/bash
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# 基础路径与默认参数（不含任何硬编码敏感密钥）
+# 基础路径与默认参数（无任何硬编码敏感密钥）
 DATA_DIR="/etc/sub-store"
 FRONTEND_DIR="/etc/sub-store/frontend"
 BACKUP_DIR="/etc/sub-store/backups"
@@ -20,8 +20,25 @@ RED="\033[31m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
+LINE="${CYAN}================================================================${RESET}"
+SUB_LINE="${CYAN}----------------------------------------------------------------${RESET}"
+
 gen_random_path() {
     head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 32
+}
+
+# 规范化域名输入（自动补全 https:// 并去除末尾斜杠）
+normalize_domain() {
+    local input="$1"
+    input="${input%/}"
+    if [ -z "$input" ]; then
+        echo ""
+        return
+    fi
+    if [[ ! "$input" =~ ^https?:// ]]; then
+        input="https://${input}"
+    fi
+    echo "$input"
 }
 
 save_config() {
@@ -29,8 +46,52 @@ save_config() {
     cat > "$CONF_FILE" <<CONF
 HOST_PORT="${HOST_PORT}"
 BACKEND_PATH="${BACKEND_PATH}"
+CUSTOM_DOMAIN="${CUSTOM_DOMAIN}"
 CONF
     chmod 600 "$CONF_FILE"
+}
+
+# 首次运行初始化向导（仅在无配置文件且非后台定时任务时触发）
+init_wizard() {
+    clear
+    echo -e "$LINE"
+    echo -e "             欢迎使用 E-Sub 首次安装初始化向导"
+    echo -e "$LINE"
+
+    # 尝试探测已有容器参数作为默认值
+    local exist_port="" exist_path=""
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+        exist_port=$(docker inspect --format='{{(index (index .HostConfig.PortBindings "3001/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+        exist_path=$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep '^SUB_STORE_FRONTEND_BACKEND_PATH=' | cut -d= -f2- || echo "")
+    fi
+
+    local def_port="${exist_port:-$DEFAULT_PORT}"
+    read -rp "1. 请输入宿主机映射端口 [直接回车默认: ${def_port}]: " input_port
+    if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
+        HOST_PORT="$input_port"
+    else
+        HOST_PORT="$def_port"
+    fi
+
+    echo ""
+    echo -e "2. 反代域名设置 (例如: ${CYAN}sub.example.com${RESET} 或 ${CYAN}http://sub.example.com${RESET})"
+    read -rp "   请输入反代域名 [若无域名直接回车使用 IP+端口]: " input_domain
+    if [ "$input_domain" = "0" ] || [ -z "$input_domain" ]; then
+        CUSTOM_DOMAIN=""
+    else
+        CUSTOM_DOMAIN=$(normalize_domain "$input_domain")
+    fi
+
+    if [ -n "$exist_path" ]; then
+        BACKEND_PATH="$exist_path"
+    else
+        BACKEND_PATH="/$(gen_random_path)"
+    fi
+
+    save_config
+    echo ""
+    echo -e "${GREEN}✅ 初始化配置已保存！专属随机密钥已生成: ${YELLOW}${BACKEND_PATH}${RESET}"
+    sleep 1
 }
 
 load_or_init_config() {
@@ -38,21 +99,18 @@ load_or_init_config() {
     if [ -f "$CONF_FILE" ]; then
         # shellcheck disable=SC1090
         source "$CONF_FILE"
-    fi
-
-    # 若本地尚无配置文件，优先尝试读取已有容器配置，否则自动生成全新随机 Path
-    if [ -z "${HOST_PORT:-}" ] || [ -z "${BACKEND_PATH:-}" ]; then
-        if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
-            EXISTING_PORT=$(docker inspect --format='{{(index (index .HostConfig.PortBindings "3001/tcp") 0).HostPort}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
-            EXISTING_PATH=$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null | grep '^SUB_STORE_FRONTEND_BACKEND_PATH=' | cut -d= -f2- || echo "")
-        fi
-        HOST_PORT="${EXISTING_PORT:-$DEFAULT_PORT}"
-        if [ -n "${EXISTING_PATH:-}" ]; then
-            BACKEND_PATH="$EXISTING_PATH"
-        else
+        HOST_PORT="${HOST_PORT:-$DEFAULT_PORT}"
+        BACKEND_PATH="${BACKEND_PATH:-/$(gen_random_path)}"
+        CUSTOM_DOMAIN="${CUSTOM_DOMAIN:-}"
+    else
+        if [ "${1:-}" = "--auto" ]; then
+            HOST_PORT="$DEFAULT_PORT"
             BACKEND_PATH="/$(gen_random_path)"
+            CUSTOM_DOMAIN=""
+            save_config
+        else
+            init_wizard
         fi
-        save_config
     fi
 }
 
@@ -78,6 +136,15 @@ check_deps() {
     mkdir -p "$FRONTEND_DIR" "$BACKUP_DIR"
 }
 
+get_base_url() {
+    if [ -n "${CUSTOM_DOMAIN:-}" ]; then
+        echo "${CUSTOM_DOMAIN}"
+    else
+        local ip="${PUBLIC_IP:-你的服务器IP}"
+        echo "http://${ip}:${HOST_PORT}"
+    fi
+}
+
 run_container() {
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     docker run -d \
@@ -92,12 +159,20 @@ run_container() {
     docker image prune -f >/dev/null 2>&1 || true
 }
 
-print_access_info() {
-    local ip="${PUBLIC_IP:-你的服务器IP}"
-    echo -e "${CYAN}------------------------------------------------${RESET}"
-    echo -e " 专属后端密钥 : ${YELLOW}${BACKEND_PATH}${RESET}"
-    echo -e " 一键登录网址 : ${GREEN}http://${ip}:${HOST_PORT}?api=http://${ip}:${HOST_PORT}${BACKEND_PATH}${RESET}"
-    echo -e "${CYAN}------------------------------------------------${RESET}"
+show_login_links() {
+    local base_url
+    base_url=$(get_base_url)
+    echo -e "$SUB_LINE"
+    echo -e " 前端访问入口 : ${GREEN}${base_url}${RESET}"
+    echo -e " 后端接口地址 : ${YELLOW}${base_url}${BACKEND_PATH}${RESET}"
+    echo -e ""
+    echo -e " ${CYAN}▼ 免填参数一键登录完整链接 (复制整行到浏览器打开):${RESET}"
+    echo -e "${GREEN}${base_url}?api=${base_url}${BACKEND_PATH}${RESET}"
+    if [ -n "${CUSTOM_DOMAIN:-}" ]; then
+        echo -e ""
+        echo -e " ${YELLOW}提示: 请确保你的反向代理 (Caddy/Nginx) 已将 ${CUSTOM_DOMAIN} 转发至 127.0.0.1:${HOST_PORT}${RESET}"
+    fi
+    echo -e "$SUB_LINE"
 }
 
 update_frontend() {
@@ -151,66 +226,119 @@ update_backend() {
         echo -e "${CYAN}[后端] 🚀 正在部署并启动容器...${RESET}"
         run_container
         echo -e "${GREEN}[后端] ✅ 容器启动完成，旧镜像已清理！${RESET}"
-        print_access_info
+        show_login_links
     else
         echo -e "${GREEN}[后端] ✨ 镜像无变化且容器运行正常，无需重启。${RESET}"
     fi
 }
 
-change_secret_or_port() {
-    echo -e "${CYAN}--- 密钥路径 (Path) 与端口管理 ---${RESET}"
-    print_access_info
-    echo -e "  ${GREEN}1.${RESET} 一键重新生成 32 位随机 Path (防泄露推荐)"
-    echo -e "  ${GREEN}2.${RESET} 自定义输入 Path 密钥路径"
-    echo -e "  ${GREEN}3.${RESET} 修改宿主机映射端口 (当前: ${HOST_PORT})"
-    echo -e "  ${GREEN}0.${RESET} 取消并返回主菜单"
-    echo -e "${CYAN}------------------------------------------------${RESET}"
+manage_config() {
+    while true; do
+        clear
+        local domain_display="${CUSTOM_DOMAIN:-未设置 (当前使用 IP:${HOST_PORT})}"
+        echo -e "$LINE"
+        echo -e "              配置管理 (反代域名 / Path / 端口)"
+        echo -e "$LINE"
+        echo -e " 当前反代域名 : ${GREEN}${domain_display}${RESET}"
+        echo -e " 当前后端密钥 : ${YELLOW}${BACKEND_PATH}${RESET}"
+        echo -e " 本地监听端口 : ${CYAN}${HOST_PORT}${RESET}"
+        echo -e "$SUB_LINE"
+        echo -e "  ${GREEN}1.${RESET} 设置 / 修改反代域名"
+        echo -e "  ${GREEN}2.${RESET} 清除反代域名 (恢复默认 IP+端口 显示)"
+        echo -e "  ${GREEN}3.${RESET} 一键重新生成 32 位随机 Path 密钥 (防泄露推荐)"
+        echo -e "  ${GREEN}4.${RESET} 自定义输入 Path 密钥路径"
+        echo -e "  ${GREEN}5.${RESET} 修改宿主机映射端口"
+        echo -e "  ${GREEN}0.${RESET} 返回主菜单"
+        echo -e "$LINE"
 
-    local sub_choice
-    read -rp "请选择操作 [0-3]: " sub_choice
-    case "$sub_choice" in
-        1)
-            BACKEND_PATH="/$(gen_random_path)"
-            save_config
-            echo -e "${GREEN}[配置] ✅ 已生成全新独享随机 Path: ${BACKEND_PATH}${RESET}"
-            ;;
-        2)
-            local custom_path
-            read -rp "请输入新的自定义 Path (无需带开头斜杠): " custom_path
-            custom_path="${custom_path#/}"
-            if [ -z "$custom_path" ]; then
-                echo -e "${RED}[配置] ❌ Path 不能为空！${RESET}"
-                return 1
-            fi
-            BACKEND_PATH="/${custom_path}"
-            save_config
-            echo -e "${GREEN}[配置] ✅ 已更新自定义 Path: ${BACKEND_PATH}${RESET}"
-            ;;
-        3)
-            local new_port
-            read -rp "请输入新的监听端口号 [1-65535]: " new_port
-            if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-                echo -e "${RED}[配置] ❌ 端口号无效！${RESET}"
-                return 1
-            fi
-            HOST_PORT="$new_port"
-            save_config
-            echo -e "${GREEN}[配置] ✅ 已更新映射端口为: ${HOST_PORT}${RESET}"
-            ;;
-        *)
-            echo -e "${YELLOW}已取消修改。${RESET}"
-            return 0
-            ;;
-    esac
+        local sub_choice need_restart="false"
+        read -rp "请选择操作 [0-5]: " sub_choice
+        echo ""
 
-    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-        echo -e "${CYAN}正在重建容器以应用新配置...${RESET}"
-        run_container
-        echo -e "${GREEN}✅ 容器已应用新配置！请使用下方新地址访问：${RESET}"
-        print_access_info
-    else
-        echo -e "${YELLOW}配置已保存，请执行菜单 [1] 完成首次安装。${RESET}"
-    fi
+        case "$sub_choice" in
+            1)
+                echo -e "示例: 输入 ${CYAN}sub.yourdomain.com${RESET} 默认按 https 处理；如需 http 请输入 ${CYAN}http://...${RESET}"
+                local new_domain
+                read -rp "请输入反代域名 (输入 0 取消): " new_domain
+                if [ "$new_domain" = "0" ] || [ -z "$new_domain" ]; then
+                    echo -e "${YELLOW}已取消域名修改。${RESET}"
+                else
+                    CUSTOM_DOMAIN=$(normalize_domain "$new_domain")
+                    save_config
+                    echo -e "${GREEN}[配置] ✅ 反代域名已更新为: ${CUSTOM_DOMAIN}${RESET}"
+                    show_login_links
+                fi
+                ;;
+            2)
+                CUSTOM_DOMAIN=""
+                save_config
+                echo -e "${GREEN}[配置] ✅ 已清除反代域名，恢复 IP+端口 模式。${RESET}"
+                ;;
+            3)
+                local confirm_gen
+                read -rp "确认重新生成随机 Path 吗？旧订阅链接需更新接口 [y/N (输入 0 取消)]: " confirm_gen
+                if [[ "$confirm_gen" =~ ^[yY]$ ]]; then
+                    BACKEND_PATH="/$(gen_random_path)"
+                    save_config
+                    need_restart="true"
+                    echo -e "${GREEN}[配置] ✅ 已生成全新随机 Path: ${BACKEND_PATH}${RESET}"
+                else
+                    echo -e "${YELLOW}已取消重置随机 Path。${RESET}"
+                fi
+                ;;
+            4)
+                local custom_path
+                read -rp "请输入新的自定义 Path，无需带开头斜杠 (输入 0 取消): " custom_path
+                if [ "$custom_path" = "0" ] || [ -z "$custom_path" ]; then
+                    echo -e "${YELLOW}已取消自定义 Path 修改。${RESET}"
+                else
+                    custom_path="${custom_path#/}"
+                    if [ -z "$custom_path" ] || [ "$custom_path" = "0" ]; then
+                        echo -e "${YELLOW}已取消自定义 Path 修改。${RESET}"
+                    else
+                        BACKEND_PATH="/${custom_path}"
+                        save_config
+                        need_restart="true"
+                        echo -e "${GREEN}[配置] ✅ 已更新自定义 Path: ${BACKEND_PATH}${RESET}"
+                    fi
+                fi
+                ;;
+            5)
+                local new_port
+                read -rp "请输入新的宿主机映射端口 [1-65535] (输入 0 取消): " new_port
+                if [ "$new_port" = "0" ] || [ -z "$new_port" ]; then
+                    echo -e "${YELLOW}已取消端口修改。${RESET}"
+                elif ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+                    echo -e "${RED}[配置] ❌ 端口号无效！${RESET}"
+                else
+                    HOST_PORT="$new_port"
+                    save_config
+                    need_restart="true"
+                    echo -e "${GREEN}[配置] ✅ 已更新映射端口为: ${HOST_PORT}${RESET}"
+                fi
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                echo -e "${RED}输入无效，请输入 0 到 5 之间的数字！${RESET}"
+                ;;
+        esac
+
+        if [ "$need_restart" = "true" ]; then
+            if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+                echo -e "${CYAN}正在重建容器以应用新配置...${RESET}"
+                run_container
+                echo -e "${GREEN}✅ 容器已重建生效！最新连接信息如下：${RESET}"
+                show_login_links
+            else
+                echo -e "${YELLOW}配置已保存，请返回主菜单执行 [1] 完成首次安装。${RESET}"
+            fi
+        fi
+
+        echo ""
+        read -rp "按回车键继续..." _
+    done
 }
 
 backup_data() {
@@ -251,7 +379,7 @@ restore_data() {
         ((i++))
     done
     echo -e "  ${GREEN}0.${RESET} 取消并返回主菜单"
-    echo -e "${CYAN}------------------------------------------------${RESET}"
+    echo -e "$SUB_LINE"
 
     local sel
     read -rp "请输入要恢复的备份序号 [0-$((i-1))]: " sel
@@ -269,7 +397,7 @@ restore_data() {
     echo -e "${YELLOW}⚠️ 警告：恢复操作将覆盖当前的 Sub-Store 订阅与节点配置！${RESET}"
     echo -e "即将恢复文件: ${CYAN}$(basename "$target_backup")${RESET}"
     local confirm
-    read -rp "确认继续恢复吗？[y/N]: " confirm
+    read -rp "确认继续恢复吗？[y/N (输入 0 取消)]: " confirm
     if [[ ! "$confirm" =~ ^[yY]$ ]]; then
         echo -e "${YELLOW}[恢复] 已取消恢复操作。${RESET}"
         return 0
@@ -314,17 +442,17 @@ toggle_cron() {
 show_status() {
     echo -e "${CYAN}--- 容器运行状态 ---${RESET}"
     docker ps -a --filter "name=^/${CONTAINER_NAME}$" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-    print_access_info
+    show_login_links
     echo -e "\n${CYAN}--- 最近 25 行运行日志 ---${RESET}"
     docker logs --tail 25 "$CONTAINER_NAME" 2>&1 || echo "容器未创建"
 }
 
-# 初始化依赖与唯一配置
+# 1. 初始化环境与配置
 check_deps
-load_or_init_config
+load_or_init_config "${1:-}"
 install_shortcut
 
-# 兼容 Crontab 后台静默调用: e-sub --auto
+# 2. 兼容 Crontab 后台静默调用: e-sub --auto
 if [ "${1:-}" = "--auto" ]; then
     echo "=== [$(date '+%Y-%m-%d %H:%M:%S')] 自动检测更新开始 ==="
     update_frontend false
@@ -333,15 +461,23 @@ if [ "${1:-}" = "--auto" ]; then
     exit 0
 fi
 
-# 获取一次公网 IP 用于展示连接地址（超时保护不卡面板）
-PUBLIC_IP=$(curl -4fsSL --max-time 2 https://api.ipify.org 2>/dev/null || curl -4fsSL --max-time 2 https://ifconfig.me 2>/dev/null || echo "你的服务器IP")
+# 3. 仅在未设置反代域名时才探测公网 IP，加快面板打开速度
+PUBLIC_IP=""
+if [ -z "${CUSTOM_DOMAIN:-}" ]; then
+    PUBLIC_IP=$(curl -4fsSL --max-time 2 https://api.ipify.org 2>/dev/null || curl -4fsSL --max-time 2 https://ifconfig.me 2>/dev/null || echo "你的服务器IP")
+fi
 
-# 交互式主菜单循环
+# 4. 交互式主菜单循环
 while true; do
+    if [ -z "${CUSTOM_DOMAIN:-}" ] && [ -z "$PUBLIC_IP" ]; then
+        PUBLIC_IP=$(curl -4fsSL --max-time 2 https://api.ipify.org 2>/dev/null || echo "你的服务器IP")
+    fi
+    BASE_URL=$(get_base_url)
+
     clear
     FE_VER=$(cat "$VERSION_FILE" 2>/dev/null || echo "未安装")
     if [ "$(docker inspect --format='{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" = "true" ]; then
-        STATUS_STR="${GREEN}运行中 (端口: ${HOST_PORT})${RESET}"
+        STATUS_STR="${GREEN}运行中 (本地端口: ${HOST_PORT})${RESET}"
     else
         STATUS_STR="${RED}未运行 (预设端口: ${HOST_PORT})${RESET}"
     fi
@@ -351,15 +487,14 @@ while true; do
         CRON_STR="${YELLOW}未开启${RESET}"
     fi
 
-    echo -e "${CYAN}================================================${RESET}"
-    echo -e "          E-Sub (Sub-Store) 交互式管理面板       "
-    echo -e "${CYAN}================================================${RESET}"
+    echo -e "$LINE"
+    echo -e "               E-Sub (Sub-Store) 交互式管理面板"
+    echo -e "$LINE"
     echo -e " 容器状态 : ${STATUS_STR}"
-    echo -e " 前端版本 : ${GREEN}${FE_VER}${RESET}"
-    echo -e " 自动更新 : ${CRON_STR}"
-    echo -e " 后端密钥 : ${YELLOW}${BACKEND_PATH}${RESET}"
-    echo -e " 登录地址 : ${GREEN}http://${PUBLIC_IP}:${HOST_PORT}?api=http://${PUBLIC_IP}:${HOST_PORT}${BACKEND_PATH}${RESET}"
-    echo -e "${CYAN}------------------------------------------------${RESET}"
+    echo -e " 前端版本 : ${GREEN}${FE_VER}${RESET}    自动更新 : ${CRON_STR}"
+    echo -e " 前端入口 : ${GREEN}${BASE_URL}${RESET}"
+    echo -e " 后端接口 : ${YELLOW}${BASE_URL}${BACKEND_PATH}${RESET}"
+    echo -e "$SUB_LINE"
     echo -e "  ${GREEN}1.${RESET} 安装 / 智能增量更新前后端 (推荐)"
     echo -e "  ${GREEN}2.${RESET} 仅强制重下并热更新前端"
     echo -e "  ${GREEN}3.${RESET} 强制拉取镜像并重建后端容器"
@@ -367,10 +502,11 @@ while true; do
     echo -e "  ${GREEN}5.${RESET} 查看容器状态与实时日志"
     echo -e "  ${GREEN}6.${RESET} 开启 / 关闭每日凌晨自动更新"
     echo -e "  ${GREEN}7.${RESET} 从备份文件恢复配置数据"
-    echo -e "  ${GREEN}8.${RESET} 重置随机 Path 密钥 / 修改端口"
+    echo -e "  ${GREEN}8.${RESET} 配置管理 (反代域名 / Path 密钥 / 端口)"
+    echo -e "  ${GREEN}9.${RESET} 获取免填参数一键登录完整链接"
     echo -e "  ${GREEN}0.${RESET} 退出脚本"
-    echo -e "${CYAN}================================================${RESET}"
-    read -rp "请输入选项数字 [0-8]: " choice
+    echo -e "$LINE"
+    read -rp "请输入选项数字 [0-9]: " choice
     echo ""
 
     case "$choice" in
@@ -400,14 +536,18 @@ while true; do
             restore_data
             ;;
         8)
-            change_secret_or_port
+            manage_config
+            continue
+            ;;
+        9)
+            show_login_links
             ;;
         0)
             echo -e "${GREEN}已退出管理面板（随时输入 e-sub 可再次打开）。${RESET}"
             exit 0
             ;;
         *)
-            echo -e "${RED}输入无效，请输入 0 到 8 之间的数字！${RESET}"
+            echo -e "${RED}输入无效，请输入 0 到 9 之间的数字！${RESET}"
             ;;
     esac
     echo ""
